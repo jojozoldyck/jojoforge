@@ -1,0 +1,1449 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<title>🌸 JojoForge</title>
+<style>*{margin:0;padding:0;box-sizing:border-box;}html,body{height:100%;overflow:hidden;background:#13101a;-webkit-tap-highlight-color:transparent;}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useCallback } = React;
+const SW = 64, SH = 64, MAX_HIST = 40;
+const CATS = ["Hats","Heads","Bodies","Swords"];
+const CAT_ICONS = { Hats:"🎩", Heads:"👤", Bodies:"🧥", Swords:"⚔️" };
+const DEFAULT_PALETTE = [
+  "#ffffff","#cccccc","#888888","#444444","#111111","#000000",
+  "#e94560","#f5a623","#ffd93d","#7ed321","#b388ff","#e0b0ff",
+  "#ff9a3c","#48cae4","#ff6b6b","#6bcb77","#0f3460","#533483",
+  "#b7e4c7","#f8edeb","#1e1630","#16213e","#ff4d6d","#a8dadc",
+];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const blank   = (w=SW,h=SH) => new Uint8ClampedArray(w*h*4);
+const clonePx = a => new Uint8ClampedArray(a);
+const hex2rgb = h => [parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];
+const rgb2hex = (r,g,b) => “#”+[r,g,b].map(v=>v.toString(16).padStart(2,“0”)).join(””);
+const colDist = (r1,g1,b1,r2,g2,b2) => Math.sqrt((r1-r2)**2+(g1-g2)**2+(b1-b2)**2);
+
+function putPx(res,x,y,rgba,fw,fh){
+if(x<0||x>=fw||y<0||y>=fh) return;
+const i=(y*fw+x)*4; res[i]=rgba[0];res[i+1]=rgba[1];res[i+2]=rgba[2];res[i+3]=rgba[3];
+}
+
+function floodFill(px,x,y,[fr,fg,fb],fw,fh){
+const i=(y*fw+x)*4,[tr,tg,tb,ta]=[px[i],px[i+1],px[i+2],px[i+3]];
+if(tr===fr&&tg===fg&&tb===fb&&ta===255) return px;
+const res=clonePx(px),stack=[[x,y]],seen=new Set();
+while(stack.length){
+const [cx,cy]=stack.pop();
+if(cx<0||cx>=fw||cy<0||cy>=fh) continue;
+const k=cy*fw+cx; if(seen.has(k)) continue;
+const ci=k*4;
+if(res[ci]!==tr||res[ci+1]!==tg||res[ci+2]!==tb||res[ci+3]!==ta) continue;
+seen.add(k); res[ci]=fr;res[ci+1]=fg;res[ci+2]=fb;res[ci+3]=255;
+stack.push([cx+1,cy],[cx-1,cy],[cx,cy+1],[cx,cy-1]);
+}
+return res;
+}
+
+function drawLine(px,x0,y0,x1,y1,rgba,fw,fh){
+const res=clonePx(px);
+const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;
+let err=dx-dy,x=x0,y=y0;
+for(let i=0;i<10000;i++){
+putPx(res,x,y,rgba,fw,fh);
+if(x===x1&&y===y1) break;
+const e2=2*err; if(e2>-dy){err-=dy;x+=sx;} if(e2<dx){err+=dx;y+=sy;}
+}
+return res;
+}
+
+function drawRect(px,x0,y0,x1,y1,rgba,filled,fw,fh){
+const res=clonePx(px);
+const minX=Math.min(x0,x1),maxX=Math.max(x0,x1),minY=Math.min(y0,y1),maxY=Math.max(y0,y1);
+for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
+if(filled||x===minX||x===maxX||y===minY||y===maxY) putPx(res,x,y,rgba,fw,fh);
+}
+return res;
+}
+
+function drawEllipse(px,x0,y0,x1,y1,rgba,filled,fw,fh){
+const res=clonePx(px);
+const cx=(x0+x1)/2,cy=(y0+y1)/2,rx=Math.abs(x1-x0)/2,ry=Math.abs(y1-y0)/2;
+if(rx<1||ry<1) return res;
+const steps=Math.max(rx,ry)*4;
+const pts=new Set();
+for(let i=0;i<=steps;i++){
+const a=(i/steps)*2*Math.PI;
+const px2=Math.round(cx+rx*Math.cos(a)),py=Math.round(cy+ry*Math.sin(a));
+pts.add(`${px2},${py}`); putPx(res,px2,py,rgba,fw,fh);
+}
+if(filled){
+for(let y=Math.ceil(cy-ry);y<=Math.floor(cy+ry);y++){
+const dy2=(y-cy)/ry, dx2=Math.sqrt(Math.max(0,1-dy2*dy2))*rx;
+for(let x=Math.ceil(cx-dx2);x<=Math.floor(cx+dx2);x++) putPx(res,x,y,rgba,fw,fh);
+}
+}
+return res;
+}
+
+function drawTriangle(px,x0,y0,x1,y1,rgba,filled,fw,fh){
+const res=clonePx(px);
+// Isoceles: top center, bottom-left, bottom-right
+const tx=Math.round((x0+x1)/2),ty=y0,bl={x:x0,y:y1},br={x:x1,y:y1};
+const lineInto=(r,ax,ay,bx,by)=>{ const dx=Math.abs(bx-ax),dy=Math.abs(by-ay),sx=ax<bx?1:-1,sy=ay<by?1:-1; let err=dx-dy,x=ax,y=ay; for(let i=0;i<10000;i++){putPx(r,x,y,rgba,fw,fh);if(x===bx&&y===by)break;const e2=2*err;if(e2>-dy){err-=dy;x+=sx;}if(e2<dx){err+=dx;y+=sy;}} };
+if(filled){
+const minY=Math.min(ty,y1),maxY=Math.max(ty,y1);
+for(let y=minY;y<=maxY;y++){
+const t=(y-ty)/(y1-ty||1);
+const lx=Math.round(tx+(x0-tx)*t),rx2=Math.round(tx+(x1-tx)*t);
+for(let x=Math.min(lx,rx2);x<=Math.max(lx,rx2);x++) putPx(res,x,y,rgba,fw,fh);
+}
+} else {
+lineInto(res,tx,ty,bl.x,bl.y); lineInto(res,bl.x,bl.y,br.x,br.y); lineInto(res,br.x,br.y,tx,ty);
+}
+return res;
+}
+
+function autoOutline(px,outlineRgba,fw,fh){
+const res=clonePx(px);
+for(let y=0;y<fh;y++) for(let x=0;x<fw;x++){
+const i=(y*fw+x)*4;
+if(px[i+3]>0) continue; // skip non-transparent
+const neighbors=[[x-1,y],[x+1,y],[x,y-1],[x,y+1]];
+if(neighbors.some(([nx,ny])=>nx>=0&&nx<fw&&ny>=0&&ny<fh&&px[(ny*fw+nx)*4+3]>0)){
+res[i]=outlineRgba[0];res[i+1]=outlineRgba[1];res[i+2]=outlineRgba[2];res[i+3]=255;
+}
+}
+return res;
+}
+
+function flipH(px,fw,fh){
+const res=clonePx(px);
+for(let y=0;y<fh;y++) for(let x=0;x<Math.floor(fw/2);x++){
+const a=(y*fw+x)*4,b=(y*fw+(fw-1-x))*4;
+for(let c=0;c<4;c++){const t=res[a+c];res[a+c]=res[b+c];res[b+c]=t;}
+}
+return res;
+}
+
+function flipV(px,fw,fh){
+const res=clonePx(px);
+for(let y=0;y<Math.floor(fh/2);y++) for(let x=0;x<fw;x++){
+const a=(y*fw+x)*4,b=((fh-1-y)*fw+x)*4;
+for(let c=0;c<4;c++){const t=res[a+c];res[a+c]=res[b+c];res[b+c]=t;}
+}
+return res;
+}
+
+function rotate90(px,fw,fh){
+// CW 90: new[x][y] = old[fh-1-y][x], new dims = fh x fw
+const res=new Uint8ClampedArray(fw*fh*4);
+for(let y=0;y<fh;y++) for(let x=0;x<fw;x++){
+const src=(y*fw+x)*4, dst=(x*fh+(fh-1-y))*4;
+res[dst]=px[src];res[dst+1]=px[src+1];res[dst+2]=px[src+2];res[dst+3]=px[src+3];
+}
+return res; // dims swapped: fh x fw
+}
+
+function makeCat(){
+return {clips:[{id:“c0”,name:“idle”}],activeClip:0,activeFrame:0,activeLayer:0,
+frames:[[{id:“l0”,name:“Layer 1”,visible:true,locked:false,px:blank()}]]};
+}
+
+function drawLayers(ctx,layers,scale=1,fw=SW,fh=SH){
+layers.forEach(l=>{
+if(!l.visible) return;
+const aw=l.fw||fw, ah=l.fh||fh;
+const tmp=document.createElement(“canvas”); tmp.width=aw; tmp.height=ah;
+tmp.getContext(“2d”).putImageData(new ImageData(new Uint8ClampedArray(l.px),aw,ah),0,0);
+ctx.imageSmoothingEnabled=false;
+ctx.drawImage(tmp,0,0,aw*scale,ah*scale);
+});
+}
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+function FrameThumb({fi,layers,isActive,onClick,fw=SW,fh=SH}){
+const ref=useRef(null);
+useEffect(()=>{
+const c=ref.current; if(!c) return;
+const ctx=c.getContext(“2d”); c.width=fw; c.height=fh; ctx.clearRect(0,0,fw,fh);
+drawLayers(ctx,layers,1,fw,fh);
+});
+return (
+<div onClick={onClick} style={{flexShrink:0,cursor:“pointer”,padding:2,borderRadius:4,
+border:`2px solid ${isActive?"#b388ff":"#2e2444"}`,background:”#120f1e”}}>
+<canvas ref={ref} style={{width:36,height:36,imageRendering:“pixelated”,display:“block”}}/>
+<div style={{fontSize:9,color:”#9a8ab8”,textAlign:“center”,marginTop:1}}>{fi+1}</div>
+</div>
+);
+}
+function CatThumb({layers,label}){
+const ref=useRef(null);
+useEffect(()=>{ const c=ref.current; if(!c) return; const ctx=c.getContext(“2d”); c.width=SW; c.height=SH; ctx.clearRect(0,0,SW,SH); drawLayers(ctx,layers); });
+return (<div style={{display:“flex”,flexDirection:“column”,alignItems:“center”,gap:2}}><canvas ref={ref} style={{width:28,height:28,imageRendering:“pixelated”,border:“1px solid #1a1a30”,borderRadius:2,background:”#120f1e”}}/><span style={{fontSize:8,color:”#7a6898”}}>{label}</span></div>);
+}
+function StackThumb({allLayers}){
+const ref=useRef(null);
+useEffect(()=>{ const c=ref.current; if(!c) return; const ctx=c.getContext(“2d”); c.width=SW; c.height=SH; ctx.clearRect(0,0,SW,SH); allLayers.forEach(ls=>drawLayers(ctx,ls)); });
+return (<div style={{display:“flex”,flexDirection:“column”,alignItems:“center”,gap:2}}><canvas ref={ref} style={{width:48,height:48,imageRendering:“pixelated”,border:“1px solid #1a1a30”,borderRadius:2,background:”#120f1e”}}/><span style={{fontSize:9,color:”#7a6898”}}>Full stack</span></div>);
+}
+
+// ── CharacterViewer ───────────────────────────────────────────────────────────
+function CharacterViewer({ onClose, dataRef, CATS, CAT_ICONS }) {
+const canvasRef = useRef(null);
+// Per-slot: { frames: […pixels], activeFrame: 0, fw, fh, name }
+const [slots, setSlots] = useState(() =>
+CATS.reduce((acc, cat) => {
+const d = dataRef.current[cat];
+return { …acc, [cat]: {
+frames: d.frames.map(fl => fl.filter(l => l.visible).reduce((out, l) => {
+const fw = l.fw || d.fw || 64, fh = l.fh || d.fh || 64;
+const res = out || new Uint8ClampedArray(fw * fh * 4);
+// composite layers
+for (let i = 0; i < res.length; i += 4) {
+const a = l.px[i+3] / 255;
+if (a > 0) {
+res[i]   = Math.round(l.px[i]   * a + res[i]   * (1-a));
+res[i+1] = Math.round(l.px[i+1] * a + res[i+1] * (1-a));
+res[i+2] = Math.round(l.px[i+2] * a + res[i+2] * (1-a));
+res[i+3] = Math.min(255, res[i+3] + l.px[i+3]);
+}
+}
+return res;
+}, null) || new Uint8ClampedArray((d.fw||64)*(d.fh||64)*4)),
+activeFrame: d.activeFrame,
+fw: d.fw || 64,
+fh: d.fh || 64,
+enabled: true,
+}};
+}, {})
+);
+const [playing, setPlaying] = useState(false);
+const [fps, setFps] = useState(8);
+const [scale, setScale] = useState(4);
+const [bgColor, setBgColor] = useState(”#1a1020”);
+const [showGrid, setShowGrid] = useState(false);
+const playRef = useRef(null);
+const tickRef = useRef(0);
+
+// Advance all enabled slots together
+useEffect(() => {
+clearInterval(playRef.current);
+if (!playing) return;
+playRef.current = setInterval(() => {
+tickRef.current++;
+setSlots(prev => {
+const next = { …prev };
+CATS.forEach(cat => {
+if (!next[cat].enabled) return;
+const total = next[cat].frames.length;
+if (total > 1) next[cat] = { …next[cat], activeFrame: tickRef.current % total };
+});
+return next;
+});
+}, 1000 / fps);
+return () => clearInterval(playRef.current);
+}, [playing, fps]);
+
+// Render composite canvas
+useEffect(() => {
+const canvas = canvasRef.current; if (!canvas) return;
+// Find max dimensions
+const maxW = Math.max(…CATS.map(c => slots[c].fw));
+const maxH = Math.max(…CATS.map(c => slots[c].fh));
+canvas.width = maxW * scale;
+canvas.height = maxH * scale;
+const ctx = canvas.getContext(“2d”);
+ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+```
+// Background
+ctx.fillStyle = bgColor;
+ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+// Checkerboard if transparent bg
+if (bgColor === "transparent") {
+  for (let y = 0; y < maxH; y++) for (let x = 0; x < maxW; x++) {
+    ctx.fillStyle = (x+y)%2===0 ? "#2a2040" : "#1a1030";
+    ctx.fillRect(x*scale, y*scale, scale, scale);
+  }
+}
+
+// Draw each enabled slot
+CATS.forEach(cat => {
+  const slot = slots[cat];
+  if (!slot.enabled) return;
+  const px = slot.frames[slot.activeFrame];
+  if (!px) return;
+  const fw = slot.fw, fh = slot.fh;
+  const tmp = document.createElement("canvas"); tmp.width = fw; tmp.height = fh;
+  tmp.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(px), fw, fh), 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  // Center the slot on the canvas
+  const ox = Math.round((maxW - fw) / 2) * scale;
+  const oy = Math.round((maxH - fh) / 2) * scale;
+  ctx.drawImage(tmp, ox, oy, fw * scale, fh * scale);
+});
+
+// Grid overlay
+if (showGrid) {
+  ctx.strokeStyle = "rgba(255,255,255,0.1)"; ctx.lineWidth = 0.5;
+  for (let x = 0; x <= maxW; x++) { ctx.beginPath(); ctx.moveTo(x*scale,0); ctx.lineTo(x*scale,canvas.height); ctx.stroke(); }
+  for (let y = 0; y <= maxH; y++) { ctx.beginPath(); ctx.moveTo(0,y*scale); ctx.lineTo(canvas.width,y*scale); ctx.stroke(); }
+}
+```
+
+}, [slots, scale, bgColor, showGrid]);
+
+const downloadComposite = () => {
+const a = document.createElement(“a”);
+a.href = canvasRef.current.toDataURL(“image/png”);
+a.download = “character_composite.png”;
+a.click();
+};
+
+const S = {
+slot: (enabled) => ({
+background: enabled ? “#1e1630” : “#120f1e”,
+border: `1px solid ${enabled ? "#b388ff55" : "#2a2040"}`,
+borderRadius: 8, padding: “8px 10px”,
+display: “flex”, alignItems: “center”, gap: 8, cursor: “pointer”,
+opacity: enabled ? 1 : 0.5,
+}),
+};
+
+return (
+<div onClick={onClose} style={{position:“fixed”,inset:0,background:“rgba(0,0,0,0.92)”,zIndex:999,display:“flex”,alignItems:“center”,justifyContent:“center”,padding:16}}>
+<div onClick={e=>e.stopPropagation()} style={{background:”#13101a”,border:“1px solid #3a2a58”,borderRadius:14,padding:20,width:“100%”,maxWidth:700,maxHeight:“90vh”,overflow:“auto”,display:“flex”,flexDirection:“column”,gap:16}}>
+
+```
+    {/* Header */}
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+      <span style={{color:"#e0b0ff",fontWeight:900,fontSize:17,letterSpacing:2,textShadow:"0 0 16px #b388ff88"}}>👁 Character Preview</span>
+      <button onClick={onClose} style={{background:"none",border:"none",color:"#555",cursor:"pointer",fontSize:20}}>✕</button>
+    </div>
+
+    <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
+      {/* Canvas */}
+      <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:10,flex:"1 1 200px"}}>
+        <canvas ref={canvasRef} style={{imageRendering:"pixelated",borderRadius:6,border:"1px solid #2a2040",boxShadow:"0 4px 24px #0006"}}/>
+        {/* Playback controls */}
+        <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",justifyContent:"center"}}>
+          <button onClick={()=>setPlaying(!playing)}
+            style={{padding:"6px 14px",borderRadius:6,border:`1px solid ${playing?"#e94560":"#7ed321"}55`,background:"transparent",color:playing?"#e94560":"#7ed321",cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:700}}>
+            {playing ? "⏹ Stop" : "▶ Play"}
+          </button>
+          <div style={{display:"flex",alignItems:"center",gap:4}}>
+            <span style={{color:"#666",fontSize:10}}>FPS</span>
+            <input type="number" min={1} max={60} value={fps} onChange={e=>setFps(+e.target.value)}
+              style={{width:38,background:"#120f1e",border:"1px solid #2e2444",borderRadius:5,padding:"3px 5px",color:"#ede0ff",fontSize:11,fontFamily:"inherit"}}/>
+          </div>
+          <div style={{display:"flex",gap:4,alignItems:"center"}}>
+            <span style={{color:"#666",fontSize:10}}>Scale</span>
+            {[2,3,4,6,8].map(s=>(
+              <button key={s} onClick={()=>setScale(s)}
+                style={{padding:"3px 7px",borderRadius:4,border:`1px solid ${scale===s?"#b388ff":"#2e2444"}`,background:scale===s?"#b388ff22":"transparent",color:scale===s?"#b388ff":"#666",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>{s}x</button>
+            ))}
+          </div>
+        </div>
+        {/* BG color + grid */}
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",justifyContent:"center"}}>
+          <span style={{color:"#666",fontSize:10}}>BG</span>
+          {["transparent","#1a1020","#ffffff","#2a1a4e","#0a1a0a"].map(bg=>(
+            <div key={bg} onClick={()=>setBgColor(bg)}
+              style={{width:20,height:20,borderRadius:4,cursor:"pointer",border:`2px solid ${bgColor===bg?"#e0b0ff":"#2a2040"}`,
+                background:bg==="transparent"?"repeating-conic-gradient(#2a2040 0% 25%,#1a1030 0% 50%) 0 0/8px 8px":bg,boxSizing:"border-box"}}/>
+          ))}
+          <label style={{display:"flex",alignItems:"center",gap:4,cursor:"pointer",color:showGrid?"#e0b0ff":"#555",fontSize:10}}>
+            <input type="checkbox" checked={showGrid} onChange={e=>setShowGrid(e.target.checked)} style={{accentColor:"#b388ff"}}/>Grid
+          </label>
+          <button onClick={downloadComposite}
+            style={{padding:"4px 10px",borderRadius:5,border:"1px solid #7ed32155",background:"transparent",color:"#7ed321",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>
+            📤 Save
+          </button>
+        </div>
+      </div>
+
+      {/* Slot controls */}
+      <div style={{display:"flex",flexDirection:"column",gap:8,flex:"1 1 200px"}}>
+        <div style={{color:"#9a7acc",fontSize:9,letterSpacing:2,fontWeight:700}}>LAYERS</div>
+        {CATS.map(cat => {
+          const slot = slots[cat];
+          return (
+            <div key={cat} style={S.slot(slot.enabled)} onClick={()=>setSlots(p=>({...p,[cat]:{...p[cat],enabled:!p[cat].enabled}}))}>
+              <span style={{fontSize:18}}>{CAT_ICONS[cat]}</span>
+              <div style={{flex:1}}>
+                <div style={{color:slot.enabled?"#e0b0ff":"#666",fontWeight:700,fontSize:12}}>{cat}</div>
+                <div style={{color:"#555",fontSize:10}}>{slot.frames.length} frame{slot.frames.length!==1?"s":""} · {slot.fw}×{slot.fh}</div>
+              </div>
+              <div style={{color:slot.enabled?"#b388ff":"#333",fontSize:12}}>{slot.enabled?"👁":"🚫"}</div>
+            </div>
+          );
+        })}
+        <div style={{color:"#555",fontSize:10,marginTop:4,lineHeight:1.6}}>
+          Tap a slot to toggle visibility.<br/>
+          Showing current frame from each category.
+        </div>
+
+        {/* Per-slot frame selector */}
+        <div style={{color:"#9a7acc",fontSize:9,letterSpacing:2,fontWeight:700,marginTop:4}}>FRAME SELECT</div>
+        {CATS.map(cat => {
+          const slot = slots[cat];
+          if (!slot.enabled || slot.frames.length <= 1) return null;
+          return (
+            <div key={cat} style={{display:"flex",alignItems:"center",gap:6}}>
+              <span style={{color:"#666",fontSize:10,width:44,flexShrink:0}}>{cat.slice(0,4)}</span>
+              <input type="range" min={0} max={slot.frames.length-1} value={slot.activeFrame}
+                onChange={e=>setSlots(p=>({...p,[cat]:{...p[cat],activeFrame:+e.target.value}}))}
+                style={{flex:1,accentColor:"#b388ff"}}/>
+              <span style={{color:"#666",fontSize:10,width:20,textAlign:"right"}}>{slot.activeFrame+1}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  </div>
+</div>
+```
+
+);
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App(){
+const [activeCat,setActiveCatState] = useState(“Heads”);
+const [tool,setTool]               = useState(“pencil”);
+const [color,setColor]             = useState(”#e94560”);
+const [brushSz,setBrushSz]         = useState(1);
+const [zoom,setZoom]               = useState(6);
+const [showGrid,setShowGrid]       = useState(true);
+const [symmetry,setSymmetry]       = useState(false);
+const [onionSkin,setOnionSkin]     = useState(false);
+const [antiAlias,setAntiAlias]     = useState(0); // 0-1 slider
+const [palette,setPalette]         = useState(DEFAULT_PALETTE);
+const [recentColors,setRecentColors] = useState([]);
+const [sideOpen,setSideOpen]       = useState(true);
+const [rightOpen,setRightOpen]     = useState(true);
+const [isPlaying,setIsPlaying]     = useState(false);
+const [fps,setFps]                 = useState(8);
+const [refImg,setRefImg]           = useState(null);
+const [refOpacity,setRefOpacity]   = useState(0.3);
+const [rcFrom,setRcFrom]           = useState(”#e94560”);
+const [rcTo,setRcTo]               = useState(”#b388ff”);
+const [rcTol,setRcTol]             = useState(40);
+const [rcAllFrames,setRcAllFrames] = useState(false);
+const [hsbH,setHsbH]               = useState(0);
+const [hsbS,setHsbS]               = useState(100);
+const [hsbB,setHsbB]               = useState(100);
+const [showHSB,setShowHSB]         = useState(false);
+const [shapeFill,setShapeFill]     = useState(false);
+const [tick,setTick]               = useState(0);
+const [spriteW,setSpriteW]         = useState(SW);
+const [spriteH,setSpriteH]         = useState(SH);
+const [showViewer,setShowViewer]   = useState(false);
+const [exportUrl,setExportUrl]     = useState(null);
+const [exportName,setExportName]   = useState(””);
+const [importModal,setImportModal] = useState(null);
+// lasso
+const [lassoPath,setLassoPath]     = useState(null); // array of {x,y}
+const [lassoSel,setLassoSel]       = useState(null); // {minX,minY,maxX,maxY,mask,pixels}
+// shape preview
+const [shapePreview,setShapePreview] = useState(null); // {tool,x0,y0,x1,y1}
+
+const dataRef      = useRef(null);
+const spriteWRef   = useRef(SW);
+const spriteHRef   = useRef(SH);
+if(!dataRef.current){dataRef.current={};CATS.forEach(c=>dataRef.current[c]=makeCat());}
+
+const canvasRef    = useRef(null);
+const overlayRef   = useRef(null); // for shape/lasso preview
+const drawing      = useRef(false);
+const lastPos      = useRef(null);
+const shapeStart   = useRef(null);
+const lassoPoints  = useRef([]);
+const histRef      = useRef([]);
+const histIdx      = useRef(-1);
+const playTimer    = useRef(null);
+const prevRef      = useRef(null);
+const importFileRef= useRef(null);
+const pinchRef     = useRef(null); // {dist, midX, midY, startZoom}
+const panRef       = useRef(null); // {startX, startY, scrollLeft, scrollTop}
+const canvasWrapRef= useRef(null);
+const [isMobile, setIsMobile] = useState(false);
+const [showToolPicker, setShowToolPicker] = useState(false);
+const [activePanel, setActivePanel] = useState(‘tools’); // tools | color | layers | frames
+
+const toolRef   = useRef(tool);    useEffect(()=>{toolRef.current=tool;},[tool]);
+const colorRef  = useRef(color);   useEffect(()=>{colorRef.current=color;},[color]);
+const brushRef  = useRef(brushSz); useEffect(()=>{brushRef.current=brushSz;},[brushSz]);
+const symRef    = useRef(symmetry);useEffect(()=>{symRef.current=symmetry;},[symmetry]);
+const zoomRef   = useRef(zoom);    useEffect(()=>{zoomRef.current=zoom;},[zoom]);
+const catRef    = useRef(activeCat);
+const fillRef   = useRef(shapeFill);useEffect(()=>{fillRef.current=shapeFill;},[shapeFill]);
+const aaRef     = useRef(antiAlias);useEffect(()=>{aaRef.current=antiAlias;},[antiAlias]);
+
+useEffect(()=>{spriteWRef.current=spriteW;spriteHRef.current=spriteH;setTimeout(()=>{renderCanvas();renderOverlay();},0);},[spriteW,spriteH]);
+
+const redraw = useCallback(()=>setTick(t=>t+1),[]);
+useEffect(()=>{ setIsMobile(window.innerWidth < 768 || ‘ontouchstart’ in window); },[]);
+
+const setActiveCat = cat=>{
+setActiveCatState(cat); catRef.current=cat;
+setTimeout(()=>{renderCanvas();renderPrev();},0);
+};
+
+const fw = ()=>spriteWRef.current;
+const fh = ()=>spriteHRef.current;
+
+const getCurPx = ()=>{
+const d=dataRef.current[catRef.current];
+return d.frames[d.activeFrame]?.[d.activeLayer]?.px||blank(fw(),fh());
+};
+const setCurPx = px=>{
+const d=dataRef.current[catRef.current];
+if(d.frames[d.activeFrame]?.[d.activeLayer]) d.frames[d.activeFrame][d.activeLayer].px=px;
+};
+
+const pushHist = px=>{
+const h=histRef.current.slice(0,histIdx.current+1);
+h.push(clonePx(px)); if(h.length>MAX_HIST) h.shift();
+histRef.current=h; histIdx.current=h.length-1;
+};
+
+const undo = useCallback(()=>{
+if(histIdx.current<=0) return;
+histIdx.current–;
+setCurPx(clonePx(histRef.current[histIdx.current]));
+renderCanvas();renderPrev();redraw();
+},[]);
+const redo = useCallback(()=>{
+if(histIdx.current>=histRef.current.length-1) return;
+histIdx.current++;
+setCurPx(clonePx(histRef.current[histIdx.current]));
+renderCanvas();renderPrev();redraw();
+},[]);
+
+const addRecentColor = c=>{
+setRecentColors(prev=>{
+const filtered=prev.filter(x=>x!==c);
+return [c,…filtered].slice(0,12);
+});
+};
+
+const paintAt = (px,x,y,rgba,fw2=fw(),fh2=fh())=>{
+const res=clonePx(px),sz=brushRef.current;
+const aa=aaRef.current;
+for(let dy=0;dy<sz;dy++) for(let dx=0;dx<sz;dx++){
+if(aa>0&&sz>1){
+// soft brush edges with aa
+const dist=Math.sqrt((dx-sz/2+0.5)**2+(dy-sz/2+0.5)**2)/(sz/2);
+const alpha=Math.max(0,Math.min(1,1-dist)*(1-aa*0.7));
+const blended=[rgba[0],rgba[1],rgba[2],Math.round(rgba[3]*alpha)];
+putPx(res,x+dx,y+dy,blended,fw2,fh2);
+if(symRef.current) putPx(res,fw2-1-x-dx,y+dy,blended,fw2,fh2);
+} else {
+putPx(res,x+dx,y+dy,rgba,fw2,fh2);
+if(symRef.current) putPx(res,fw2-1-x-dx,y+dy,rgba,fw2,fh2);
+}
+}
+return res;
+};
+
+const interpolate=(x0,y0,x1,y1,rgba,startPx,fw2=fw(),fh2=fh())=>{
+let px=clonePx(startPx);
+const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;
+let err=dx-dy,x=x0,y=y0;
+for(let i=0;i<10000;i++){
+px=paintAt(px,x,y,rgba,fw2,fh2); if(x===x1&&y===y1) break;
+const e2=2*err; if(e2>-dy){err-=dy;x+=sx;} if(e2<dx){err+=dx;y+=sy;}
+}
+return px;
+};
+
+const getCoords = e=>{
+const c=canvasRef.current; if(!c) return null;
+const rect=c.getBoundingClientRect();
+const scX=c.width/rect.width,scY=c.height/rect.height;
+const touch=e.touches?.[0]||e.changedTouches?.[0];
+const cX=touch?touch.clientX:e.clientX;
+const cY=touch?touch.clientY:e.clientY;
+const z=zoomRef.current;
+return [Math.max(0,Math.min(fw()-1,Math.floor((cX-rect.left)*scX/z))),
+Math.max(0,Math.min(fh()-1,Math.floor((cY-rect.top)*scY/z)))];
+};
+
+// ── Canvas render ────────────────────────────────────────────────────────────
+const renderCanvas = useCallback(()=>{
+const canvas=canvasRef.current; if(!canvas) return;
+const ctx=canvas.getContext(“2d”),z=zoomRef.current,W=spriteWRef.current*z,H=spriteHRef.current*z;
+if(canvas.width!==W||canvas.height!==H){canvas.width=W;canvas.height=H;}
+ctx.clearRect(0,0,W,H);
+const sw=spriteWRef.current,sh=spriteHRef.current;
+for(let cy=0;cy<sh;cy++) for(let cx=0;cx<sw;cx++){ctx.fillStyle=(cx+cy)%2===0?”#201830”:”#180f28”;ctx.fillRect(cx*z,cy*z,z,z);}
+const d=dataRef.current[catRef.current];
+if(refImg){const img=new Image();img.src=refImg;if(img.complete){ctx.globalAlpha=refOpacity;ctx.imageSmoothingEnabled=false;ctx.drawImage(img,0,0,W,H);ctx.globalAlpha=1;}}
+if(onionSkin&&d.activeFrame>0){
+(d.frames[d.activeFrame-1]||[]).forEach(l=>{if(!l.visible)return;const aw=l.fw||sw,ah=l.fh||sh;const tmp=document.createElement(“canvas”);tmp.width=aw;tmp.height=ah;tmp.getContext(“2d”).putImageData(new ImageData(new Uint8ClampedArray(l.px),aw,ah),0,0);ctx.globalAlpha=0.25;ctx.imageSmoothingEnabled=false;ctx.drawImage(tmp,0,0,W,H);ctx.globalAlpha=1;});
+}
+drawLayers(ctx,d.frames[d.activeFrame]||[],z,d.fw||sw,d.fh||sh);
+if(showGrid){ctx.strokeStyle=“rgba(255,255,255,0.07)”;ctx.lineWidth=0.5;for(let cx=0;cx<=sw;cx++){ctx.beginPath();ctx.moveTo(cx*z,0);ctx.lineTo(cx*z,H);ctx.stroke();}for(let cy=0;cy<=sh;cy++){ctx.beginPath();ctx.moveTo(0,cy*z);ctx.lineTo(W,cy*z);ctx.stroke();}}
+},[showGrid,refImg,refOpacity,onionSkin]);
+
+useEffect(()=>{renderCanvas();},[renderCanvas,tick]);
+
+// ── Overlay render (shape/lasso preview) ─────────────────────────────────────
+const renderOverlay = useCallback(()=>{
+const ov=overlayRef.current; if(!ov) return;
+const canvas=canvasRef.current; if(!canvas) return;
+const z=zoomRef.current,W=spriteWRef.current*z,H=spriteHRef.current*z;
+ov.width=W; ov.height=H;
+const ctx=ov.getContext(“2d”); ctx.clearRect(0,0,W,H);
+
+```
+// lasso path preview
+if(lassoPoints.current.length>1){
+  ctx.strokeStyle="#b388ff"; ctx.lineWidth=1; ctx.setLineDash([3,2]);
+  ctx.beginPath();
+  lassoPoints.current.forEach((p,i)=>i===0?ctx.moveTo(p.x*z+z/2,p.y*z+z/2):ctx.lineTo(p.x*z+z/2,p.y*z+z/2));
+  ctx.stroke(); ctx.setLineDash([]);
+}
+
+// lasso selection box
+if(lassoSel){
+  ctx.strokeStyle="#e0b0ff"; ctx.lineWidth=1; ctx.setLineDash([4,2]);
+  ctx.strokeRect(lassoSel.minX*z,lassoSel.minY*z,(lassoSel.maxX-lassoSel.minX+1)*z,(lassoSel.maxY-lassoSel.minY+1)*z);
+  ctx.setLineDash([]);
+}
+
+// shape preview
+if(shapePreview){
+  const {tool:t,x0,y0,x1,y1}=shapePreview;
+  ctx.strokeStyle=colorRef.current; ctx.lineWidth=1; ctx.fillStyle=colorRef.current+"88";
+  if(t==="rect"){
+    const minX=Math.min(x0,x1)*z,minY=Math.min(y0,y1)*z;
+    const w=(Math.abs(x1-x0)+1)*z,h=(Math.abs(y1-y0)+1)*z;
+    if(fillRef.current){ctx.fillRect(minX,minY,w,h);}else{ctx.strokeRect(minX,minY,w,h);}
+  } else if(t==="ellipse"){
+    const cx=(x0+x1)/2*z+z/2,cy=(y0+y1)/2*z+z/2;
+    const rx=Math.abs(x1-x0)/2*z+z/2,ry=Math.abs(y1-y0)/2*z+z/2;
+    ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,2*Math.PI);
+    fillRef.current?ctx.fill():ctx.stroke();
+  } else if(t==="triangle"){
+    const tx=(x0+x1)/2*z+z/2;
+    ctx.beginPath(); ctx.moveTo(tx,y0*z); ctx.lineTo(x0*z,y1*z+z); ctx.lineTo(x1*z+z,y1*z+z); ctx.closePath();
+    fillRef.current?ctx.fill():ctx.stroke();
+  } else if(t==="line"){
+    ctx.beginPath(); ctx.moveTo(x0*z+z/2,y0*z+z/2); ctx.lineTo(x1*z+z/2,y1*z+z/2); ctx.stroke();
+  }
+}
+```
+
+},[lassoSel,shapePreview]);
+
+useEffect(()=>{renderOverlay();},[renderOverlay,tick,lassoPath,shapePreview,lassoSel]);
+
+// ── Preview render ────────────────────────────────────────────────────────────
+const renderPrev = useCallback(()=>{
+const c=prevRef.current; if(!c) return;
+const ctx=c.getContext(“2d”),sc=2,pw=spriteWRef.current*sc,ph=spriteHRef.current*sc;
+c.width=pw; c.height=ph; ctx.clearRect(0,0,pw,ph);
+for(let y=0;y<ph;y++) for(let x=0;x<pw;x++){ctx.fillStyle=(Math.floor(x/6)+Math.floor(y/6))%2===0?”#201830”:”#180f28”;ctx.fillRect(x,y,1,1);}
+const d=dataRef.current[catRef.current];
+drawLayers(ctx,d.frames[d.activeFrame]||[],sc,d.fw||spriteWRef.current,d.fh||spriteHRef.current);
+},[]);
+useEffect(()=>{renderPrev();},[renderPrev,tick]);
+
+// ── Playback ──────────────────────────────────────────────────────────────────
+useEffect(()=>{
+clearInterval(playTimer.current);
+if(!isPlaying) return;
+playTimer.current=setInterval(()=>{const d=dataRef.current[catRef.current];d.activeFrame=(d.activeFrame+1)%d.frames.length;renderCanvas();renderPrev();redraw();},1000/fps);
+return()=>clearInterval(playTimer.current);
+},[isPlaying,fps]);
+
+// ── Pointer handlers ──────────────────────────────────────────────────────────
+const onTouchStartCanvas = e => {
+if(e.touches.length===2){
+// Two fingers: pinch or pan
+e.preventDefault();
+const t0=e.touches[0],t1=e.touches[1];
+const dist=Math.hypot(t1.clientX-t0.clientX,t1.clientY-t0.clientY);
+const midX=(t0.clientX+t1.clientX)/2,midY=(t0.clientY+t1.clientY)/2;
+pinchRef.current={dist,midX,midY,startZoom:zoomRef.current};
+panRef.current=null;
+drawing.current=false;
+return;
+}
+if(e.touches.length===1) onDown(e);
+};
+
+const onTouchMoveCanvas = e => {
+if(e.touches.length===2 && pinchRef.current){
+e.preventDefault();
+const t0=e.touches[0],t1=e.touches[1];
+const dist=Math.hypot(t1.clientX-t0.clientX,t1.clientY-t0.clientY);
+const ratio=dist/pinchRef.current.dist;
+const newZoom=Math.max(1,Math.min(16,Math.round(pinchRef.current.startZoom*ratio)));
+if(newZoom!==zoomRef.current){ setZoom(newZoom); zoomRef.current=newZoom; setTimeout(renderCanvas,0); }
+return;
+}
+if(e.touches.length===1) onMove(e);
+};
+
+const onTouchEndCanvas = e => {
+if(e.touches.length===0) pinchRef.current=null;
+onUp(e);
+};
+
+const onDown = e=>{
+if(e.type===‘mousedown’&&e.sourceCapabilities?.firesTouchEvents) return;
+e.preventDefault();
+const coords=getCoords(e); if(!coords) return;
+const [x,y]=coords,t=toolRef.current,px=getCurPx();
+
+```
+if(t==="eyedropper"){
+  const i=(y*fw()+x)*4; if(px[i+3]>0){ const c=rgb2hex(px[i],px[i+1],px[i+2]); setColor(c); addRecentColor(c); }
+  setTool("pencil"); return;
+}
+if(t==="fill"){
+  const np=floodFill(px,x,y,hex2rgb(colorRef.current),fw(),fh());
+  pushHist(px); setCurPx(np); renderCanvas(); renderPrev(); redraw(); addRecentColor(colorRef.current); return;
+}
+if(t==="lasso"){
+  lassoPoints.current=[[x,y]]; setLassoPath([[x,y]]); drawing.current=true;
+  setLassoSel(null); return;
+}
+if(["line","rect","ellipse","triangle"].includes(t)){
+  shapeStart.current={x,y}; drawing.current=true;
+  setShapePreview({tool:t,x0:x,y0:y,x1:x,y1:y}); return;
+}
+// pencil/eraser
+drawing.current=true; lastPos.current={x,y};
+pushHist(px);
+const rgba=t==="eraser"?[0,0,0,0]:[...hex2rgb(colorRef.current),255];
+setCurPx(paintAt(px,x,y,rgba)); renderCanvas();
+if(t==="pencil") addRecentColor(colorRef.current);
+```
+
+};
+
+const onMove = e=>{
+if(!drawing.current) return; e.preventDefault();
+const coords=getCoords(e); if(!coords) return;
+const [x,y]=coords,t=toolRef.current;
+
+```
+if(t==="lasso"){
+  const last=lassoPoints.current[lassoPoints.current.length-1];
+  if(last[0]!==x||last[1]!==y){ lassoPoints.current.push([x,y]); setLassoPath([...lassoPoints.current]); }
+  return;
+}
+if(["line","rect","ellipse","triangle"].includes(t)){
+  setShapePreview({tool:t,x0:shapeStart.current.x,y0:shapeStart.current.y,x1:x,y1:y}); return;
+}
+if(t!=="pencil"&&t!=="eraser") return;
+const last=lastPos.current||{x,y};
+if(last.x===x&&last.y===y) return;
+const rgba=t==="eraser"?[0,0,0,0]:[...hex2rgb(colorRef.current),255];
+setCurPx(interpolate(last.x,last.y,x,y,rgba,getCurPx()));
+lastPos.current={x,y}; renderCanvas();
+```
+
+};
+
+const onUp = e=>{
+if(!drawing.current) return;
+drawing.current=false;
+const t=toolRef.current;
+
+```
+if(t==="lasso"){
+  const pts=lassoPoints.current;
+  if(pts.length<3){lassoPoints.current=[];setLassoPath(null);return;}
+  // compute bounding box and mask
+  const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  const minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys);
+  // point-in-polygon for mask
+  const mask=new Set();
+  const px2=getCurPx();
+  for(let py=minY;py<=maxY;py++) for(let px3=minX;px3<=maxX;px3++){
+    let inside=false;
+    for(let i=0,j=pts.length-1;i<pts.length;j=i++){
+      const [xi,yi]=pts[i],[xj,yj]=pts[j];
+      if(((yi>py)!==(yj>py))&&(px3<(xj-xi)*(py-yi)/(yj-yi)+xi)) inside=!inside;
+    }
+    if(inside) mask.add(`${px3},${py}`);
+  }
+  setLassoSel({minX,minY,maxX,maxY,mask,pixels:clonePx(px2)});
+  lassoPoints.current=[]; setLassoPath(null);
+  return;
+}
+
+if(["line","rect","ellipse","triangle"].includes(t)){
+  const coords=getCoords(e)||[shapeStart.current.x,shapeStart.current.y];
+  const [x1,y1]=coords,{x:x0,y:y0}=shapeStart.current;
+  const px=getCurPx(),rgba=[...hex2rgb(colorRef.current),255],filled=fillRef.current;
+  let np;
+  if(t==="line") np=drawLine(px,x0,y0,x1,y1,rgba,fw(),fh());
+  else if(t==="rect") np=drawRect(px,x0,y0,x1,y1,rgba,filled,fw(),fh());
+  else if(t==="ellipse") np=drawEllipse(px,x0,y0,x1,y1,rgba,filled,fw(),fh());
+  else if(t==="triangle") np=drawTriangle(px,x0,y0,x1,y1,rgba,filled,fw(),fh());
+  pushHist(px); setCurPx(np); shapeStart.current=null; setShapePreview(null);
+  renderCanvas(); renderPrev(); redraw(); addRecentColor(colorRef.current); return;
+}
+
+lastPos.current=null; renderPrev(); redraw();
+```
+
+};
+
+// ── Frame / clip / layer ops ──────────────────────────────────────────────────
+const setActiveFrame = fi=>{dataRef.current[activeCat].activeFrame=fi;renderCanvas();renderPrev();redraw();};
+const addFrame = ()=>{const d=dataRef.current[activeCat];const nfw=d.fw||fw(),nfh=d.fh||fh();d.frames.push([{id:`l${Date.now()}`,name:“Layer 1”,visible:true,locked:false,fw:nfw,fh:nfh,px:blank(nfw,nfh)}]);d.activeFrame=d.frames.length-1;d.activeLayer=0;renderCanvas();renderPrev();redraw();};
+const dupFrame = ()=>{const d=dataRef.current[activeCat];const src=d.frames[d.activeFrame].map(l=>({…l,px:clonePx(l.px),id:`l${Date.now()+Math.random()}`}));d.frames.splice(d.activeFrame+1,0,src);d.activeFrame++;renderCanvas();renderPrev();redraw();};
+const delFrame = ()=>{const d=dataRef.current[activeCat];if(d.frames.length<=1)return;d.frames.splice(d.activeFrame,1);d.activeFrame=Math.min(d.activeFrame,d.frames.length-1);renderCanvas();renderPrev();redraw();};
+const addClip = ()=>{const name=window.prompt(“Clip name:”,“attack”);if(!name)return;const d=dataRef.current[activeCat];d.clips.push({id:`c${Date.now()}`,name});d.activeClip=d.clips.length-1;d.frames=[[{id:`l${Date.now()}`,name:“Layer 1”,visible:true,locked:false,px:blank(fw(),fh())}]];d.activeFrame=0;d.activeLayer=0;renderCanvas();renderPrev();redraw();};
+const setActiveClip = i=>{const d=dataRef.current[activeCat];d.activeClip=i;d.activeFrame=0;renderCanvas();renderPrev();redraw();};
+const addLayer = ()=>{const d=dataRef.current[activeCat];d.frames[d.activeFrame].push({id:`l${Date.now()}`,name:`Layer ${d.frames[d.activeFrame].length+1}`,visible:true,locked:false,px:blank(fw(),fh())});d.activeLayer=d.frames[d.activeFrame].length-1;redraw();};
+const toggleLayerVis = li=>{const d=dataRef.current[activeCat];const l=d.frames[d.activeFrame][li];if(l)l.visible=!l.visible;renderCanvas();redraw();};
+const setActiveLayer = li=>{dataRef.current[activeCat].activeLayer=li;redraw();};
+
+// ── Transform ops ─────────────────────────────────────────────────────────────
+const doFlipH = ()=>{ pushHist(getCurPx()); setCurPx(flipH(getCurPx(),fw(),fh())); renderCanvas();renderPrev();redraw(); };
+const doFlipV = ()=>{ pushHist(getCurPx()); setCurPx(flipV(getCurPx(),fw(),fh())); renderCanvas();renderPrev();redraw(); };
+const doRotate = ()=>{
+const old=getCurPx(),nw=fh(),nh=fw();
+const rotated=rotate90(old,fw(),fh());
+pushHist(old); setCurPx(rotated);
+// swap dims
+const d=dataRef.current[activeCat];
+d.fw=nw; d.fh=nh;
+d.frames[d.activeFrame].forEach(l=>{l.fw=nw;l.fh=nh;l.px=rotate90(l.px,fw(),fh());});
+setSpriteW(nw); setSpriteH(nh); spriteWRef.current=nw; spriteHRef.current=nh;
+renderCanvas();renderPrev();redraw();
+};
+
+// ── Auto outline ──────────────────────────────────────────────────────────────
+const doAutoOutline = ()=>{
+const px=getCurPx();
+pushHist(px);
+setCurPx(autoOutline(px,[…hex2rgb(colorRef.current),255],fw(),fh()));
+renderCanvas();renderPrev();redraw();
+};
+
+// ── Recolor ───────────────────────────────────────────────────────────────────
+const applyRecolor = ()=>{
+const [tr,tg,tb]=hex2rgb(rcFrom),[nr,ng,nb]=hex2rgb(rcTo);
+const d=dataRef.current[activeCat];
+const frames=rcAllFrames?d.frames:[d.frames[d.activeFrame]];
+frames.forEach(fl=>{
+fl.forEach(l=>{
+if(!l.visible) return;
+const res=clonePx(l.px);
+for(let i=0;i<res.length;i+=4){if(res[i+3]===0)continue;if(colDist(res[i],res[i+1],res[i+2],tr,tg,tb)<rcTol){res[i]=nr;res[i+1]=ng;res[i+2]=nb;}}
+l.px=res;
+});
+});
+renderCanvas();renderPrev();redraw();
+};
+
+// ── HSB ───────────────────────────────────────────────────────────────────────
+const applyHSB = ()=>{
+const px=getCurPx(),res=clonePx(px);
+for(let i=0;i<res.length;i+=4){
+if(res[i+3]===0) continue;
+let r=res[i]/255,g=res[i+1]/255,b=res[i+2]/255;
+const max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;
+let h=0,s=max===0?0:d/max,v=max;
+if(d>0){switch(max){case r:h=(g-b)/d+(g<b?6:0);break;case g:h=(b-r)/d+2;break;case b:h=(r-g)/d+4;break;}h/=6;}
+h=(h+hsbH/360+1)%1;s=Math.min(1,s*hsbS/100);v=Math.min(1,v*hsbB/100);
+const i6=Math.floor(h*6),f=h*6-i6,p=v*(1-s),q=v*(1-f*s),t2=v*(1-(1-f)*s);
+let nr,ng2,nb;
+switch(i6%6){case 0:nr=v;ng2=t2;nb=p;break;case 1:nr=q;ng2=v;nb=p;break;case 2:nr=p;ng2=v;nb=t2;break;case 3:nr=p;ng2=q;nb=v;break;case 4:nr=t2;ng2=p;nb=v;break;default:nr=v;ng2=p;nb=q;}
+res[i]=Math.round(nr*255);res[i+1]=Math.round(ng2*255);res[i+2]=Math.round(nb*255);
+}
+pushHist(px);setCurPx(res);renderCanvas();renderPrev();redraw();
+};
+
+// ── Export ────────────────────────────────────────────────────────────────────
+const exportPNG = ()=>{
+const d=dataRef.current[activeCat];
+const efw=d.fw||fw(),efh=d.fh||fh();
+const c=document.createElement(“canvas”);c.width=efw*d.frames.length;c.height=efh;
+const ctx=c.getContext(“2d”);
+d.frames.forEach((fl,fi)=>{fl.forEach(l=>{if(!l.visible)return;const lw=l.fw||efw,lh=l.fh||efh;const tmp=document.createElement(“canvas”);tmp.width=lw;tmp.height=lh;tmp.getContext(“2d”).putImageData(new ImageData(new Uint8ClampedArray(l.px),lw,lh),0,0);ctx.imageSmoothingEnabled=false;ctx.drawImage(tmp,fi*efw,0);});});
+const url=c.toDataURL(“image/png”),name=`${activeCat.toLowerCase()}_${d.clips[d.activeClip]?.name||"sprite"}.png`;
+try{const a=document.createElement(“a”);a.href=url;a.download=name;document.body.appendChild(a);a.click();document.body.removeChild(a);}catch(_){}
+setExportUrl(url);setExportName(name);
+};
+
+// ── Import ────────────────────────────────────────────────────────────────────
+const handleImport = e=>{
+const file=e.target.files[0];if(!file)return;
+e.target.value=””;
+const reader=new FileReader();
+reader.onload=ev=>{
+const img=new Image();
+img.onload=()=>{
+const W=img.width,H=img.height,sizes=[8,16,24,32,48,64,72,96,128,256];
+const guessW=sizes.filter(s=>W%s===0&&s<=W).pop()||W;
+const guessH=(H%guessW===0)?guessW:(sizes.filter(s=>H%s===0&&s<=H).pop()||guessW);
+setImportModal({url:ev.target.result,imgW:W,imgH:H,frameW:guessW,frameH:guessH});
+};
+img.src=ev.target.result;
+};
+reader.readAsDataURL(file);
+};
+
+const commitImport = ()=>{
+if(!importModal) return;
+const {url,imgW,imgH,frameW,frameH}=importModal;
+const img=new Image();
+img.onload=()=>{
+const cols=Math.max(1,Math.floor(imgW/frameW)),rows=Math.max(1,Math.floor(imgH/frameH));
+const tmp=document.createElement(“canvas”);tmp.width=imgW;tmp.height=imgH;
+const tctx=tmp.getContext(“2d”);tctx.drawImage(img,0,0);
+const newFrames=[];
+for(let r=0;r<rows;r++) for(let c=0;c<cols;c++){
+const id=tctx.getImageData(c*frameW,r*frameH,frameW,frameH);
+newFrames.push([{id:`l${Date.now()+r*cols+c}`,name:“Layer 1”,visible:true,locked:false,fw:frameW,fh:frameH,px:new Uint8ClampedArray(id.data)}]);
+}
+const d=dataRef.current[activeCat];
+d.frames=newFrames;d.activeFrame=0;d.activeLayer=0;d.fw=frameW;d.fh=frameH;
+setSpriteW(frameW);setSpriteH(frameH);spriteWRef.current=frameW;spriteHRef.current=frameH;
+setImportModal(null);
+setTimeout(()=>{renderCanvas();renderPrev();redraw();},50);
+};
+img.src=url;
+};
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+useEffect(()=>{
+const fn=e=>{
+if(e.target.tagName===“INPUT”||e.target.tagName===“TEXTAREA”) return;
+if((e.ctrlKey||e.metaKey)&&e.key===“z”){e.preventDefault();undo();}
+if((e.ctrlKey||e.metaKey)&&e.key===“y”){e.preventDefault();redo();}
+if(e.key===“p”||e.key===“b”) setTool(“pencil”);
+if(e.key===“e”) setTool(“eraser”);
+if(e.key===“f”) setTool(“fill”);
+if(e.key===“i”) setTool(“eyedropper”);
+if(e.key===“l”) setTool(“line”);
+if(e.key===“r”) setTool(“rect”);
+if(e.key===“o”) setTool(“ellipse”);
+if(e.key===“s”) setTool(“lasso”);
+if(e.key===“g”) setShowGrid(v=>!v);
+if(e.key===“Escape”){setLassoSel(null);setShapePreview(null);lassoPoints.current=[];}
+};
+window.addEventListener(“keydown”,fn);return()=>window.removeEventListener(“keydown”,fn);
+},[undo,redo]);
+
+// ── Derived ───────────────────────────────────────────────────────────────────
+const d=dataRef.current[activeCat];
+const curFrameLayers=d.frames[d.activeFrame]||[];
+const compAllLayers=CATS.map(cat=>{const cd=dataRef.current[cat];return cd.frames[cd.activeFrame]||[];});
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+const B=(on,ac=”#b388ff”)=>({padding:“5px 10px”,borderRadius:6,border:`1px solid ${on?ac:ac+"44"}`,background:on?`${ac}28`:“transparent”,color:on?ac:ac+“cc”,cursor:“pointer”,fontSize:12,fontWeight:on?700:400,fontFamily:“inherit”});
+const IB=on=>({padding:“6px 10px”,borderRadius:6,border:`1px solid ${on?"#b388ff":"transparent"}`,background:on?”#2a1a4e”:“transparent”,color:on?”#e0b0ff”:”#aa99cc”,cursor:“pointer”,fontSize:13,display:“flex”,alignItems:“center”,gap:7,fontFamily:“inherit”});
+const IN={background:”#120f1e”,border:“1px solid #2e2444”,borderRadius:6,padding:“5px 10px”,color:”#ede0ff”,fontSize:12,fontFamily:“inherit”,width:“100%”,boxSizing:“border-box”};
+const SC={padding:“10px 12px”,borderBottom:“1px solid #2e2248”};
+const LB={color:”#9a7acc”,fontSize:9,letterSpacing:2,textTransform:“uppercase”,marginBottom:6,display:“block”,fontWeight:700};
+
+const tools=[
+{id:“pencil”,icon:“✏️”,label:“Pencil (P)”},
+{id:“eraser”,icon:“⬜”,label:“Eraser (E)”},
+{id:“fill”,icon:“🪣”,label:“Fill (F)”},
+{id:“eyedropper”,icon:“💧”,label:“Pick (I)”},
+{id:“line”,icon:“╱”,label:“Line (L)”},
+{id:“rect”,icon:“▭”,label:“Rect (R)”},
+{id:“ellipse”,icon:“◯”,label:“Circle (O)”},
+{id:“triangle”,icon:“△”,label:“Triangle”},
+{id:“lasso”,icon:“⬟”,label:“Lasso (S)”},
+];
+
+// Desktop side panel content as inline component
+const DesktopSidePanelContent = () => (
+<div style={{flex:1,overflow:“auto”}}>
+{[“rect”,“ellipse”,“triangle”].includes(tool)&&(
+<div style={SC}>
+<label style={{display:“flex”,alignItems:“center”,gap:6,cursor:“pointer”,color:shapeFill?”#ede0ff”:”#7a6a99”,fontSize:11}}>
+<input type=“checkbox” checked={shapeFill} onChange={e=>setShapeFill(e.target.checked)} style={{accentColor:”#b388ff”}}/>Filled shape
+</label>
+</div>
+)}
+<div style={SC}>
+<span style={LB}>Brush</span>
+<input type=“range” min={1} max={8} value={brushSz} onChange={e=>setBrushSz(+e.target.value)} style={{width:“100%”,accentColor:”#b388ff”}}/>
+<div style={{color:”#9a8ab8”,fontSize:10,textAlign:“center”}}>{brushSz}px</div>
+</div>
+<div style={SC}>
+<span style={LB}>Anti-Alias</span>
+<input type=“range” min={0} max={1} step={0.05} value={antiAlias} onChange={e=>setAntiAlias(+e.target.value)} style={{width:“100%”,accentColor:”#e0b0ff”}}/>
+<div style={{color:”#9a8ab8”,fontSize:10,textAlign:“center”}}>{antiAlias===0?“Off”:antiAlias===1?“Full”:`${Math.round(antiAlias*100)}%`}</div>
+</div>
+<div style={SC}>
+<span style={LB}>Canvas</span>
+{[{l:“Grid”,v:showGrid,s:setShowGrid},{l:“Symmetry”,v:symmetry,s:setSymmetry},{l:“Onion Skin”,v:onionSkin,s:setOnionSkin}].map(({l,v,s})=>(
+<label key={l} style={{display:“flex”,alignItems:“center”,gap:5,cursor:“pointer”,color:v?”#ede0ff”:”#7a6a99”,fontSize:11,marginBottom:4}}>
+<input type=“checkbox” checked={v} onChange={e=>s(e.target.checked)} style={{accentColor:”#b388ff”}}/>{l}
+</label>
+))}
+</div>
+<div style={SC}>
+<span style={LB}>Zoom</span>
+<div style={{display:“flex”,gap:3,flexWrap:“wrap”}}>
+{[2,4,6,8,10,12].map(z=>(
+<button key={z} onClick={()=>{setZoom(z);zoomRef.current=z;setTimeout(renderCanvas,0);}} style={{padding:“2px 5px”,borderRadius:4,border:`1px solid ${zoom===z?"#b388ff":"#b388ff33"}`,background:zoom===z?”#b388ff28”:“transparent”,color:zoom===z?”#b388ff”:”#b388ff77”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”}}>{z}x</button>
+))}
+</div>
+</div>
+<div style={SC}>
+<span style={LB}>Transform</span>
+<div style={{display:“flex”,gap:3,flexWrap:“wrap”}}>
+<button onClick={doFlipH} style={{padding:“3px 7px”,borderRadius:4,border:“1px solid #48cae444”,background:“transparent”,color:”#48cae4”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”}}>⇆H</button>
+<button onClick={doFlipV} style={{padding:“3px 7px”,borderRadius:4,border:“1px solid #48cae444”,background:“transparent”,color:”#48cae4”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”}}>⇅V</button>
+<button onClick={doRotate} style={{padding:“3px 7px”,borderRadius:4,border:“1px solid #48cae444”,background:“transparent”,color:”#48cae4”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”}}>↻90°</button>
+</div>
+<button onClick={doAutoOutline} style={{padding:“4px 8px”,borderRadius:4,border:“1px solid #ffd93d44”,background:“transparent”,color:”#ffd93d”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”,width:“100%”,marginTop:5,textAlign:“center”}}>◻ Auto Outline</button>
+{lassoSel&&(
+<div style={{marginTop:5,display:“flex”,gap:3}}>
+<button onClick={()=>{const {minX,minY,maxX,maxY,mask}=lassoSel,px=getCurPx(),res=clonePx(px);for(let y=minY;y<=maxY;y++)for(let x=minX;x<=maxX;x++)if(mask.has(`${x},${y}`)){const i=(y*fw()+x)*4;res[i+3]=0;}pushHist(px);setCurPx(res);setLassoSel(null);renderCanvas();renderPrev();redraw();}} style={{padding:“3px 7px”,borderRadius:4,border:“1px solid #e9456044”,background:“transparent”,color:”#e94560”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”,flex:1}}>✂ Cut</button>
+<button onClick={()=>setLassoSel(null)} style={{padding:“3px 7px”,borderRadius:4,border:“1px solid #2e2444”,background:“transparent”,color:”#9a8ab8”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”}}>✕</button>
+</div>
+)}
+</div>
+<div style={SC}>
+<span style={LB}>Recolor</span>
+<div style={{display:“flex”,gap:4,alignItems:“center”,marginBottom:4}}>
+<input type=“color” value={rcFrom} onChange={e=>setRcFrom(e.target.value)} style={{width:22,height:18,border:“none”,background:“none”,cursor:“pointer”,padding:0}}/>
+<span style={{color:”#666”,fontSize:9}}>→</span>
+<input type=“color” value={rcTo} onChange={e=>setRcTo(e.target.value)} style={{width:22,height:18,border:“none”,background:“none”,cursor:“pointer”,padding:0}}/>
+<input type=“range” min={1} max={100} value={rcTol} onChange={e=>setRcTol(+e.target.value)} style={{flex:1,accentColor:”#f5a623”}}/>
+<span style={{color:”#9a8ab8”,fontSize:9,width:18}}>{rcTol}</span>
+</div>
+<div style={{display:“flex”,gap:4,alignItems:“center”,marginBottom:4}}>
+<label style={{display:“flex”,alignItems:“center”,gap:4,cursor:“pointer”,color:rcAllFrames?”#ede0ff”:”#666”,fontSize:10,flex:1}}>
+<input type=“checkbox” checked={rcAllFrames} onChange={e=>setRcAllFrames(e.target.checked)} style={{accentColor:”#b388ff”}}/>All frames
+</label>
+<button onClick={applyRecolor} style={{padding:“3px 8px”,borderRadius:4,border:“1px solid #f5a62344”,background:“transparent”,color:”#f5a623”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”}}>Apply</button>
+</div>
+</div>
+<div style={SC}>
+<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“center”,marginBottom:3}}>
+<span style={LB}>HSB</span>
+<button onClick={()=>setShowHSB(!showHSB)} style={{background:“none”,border:“none”,color:”#555”,cursor:“pointer”,fontSize:10}}>{showHSB?“▲”:“▼”}</button>
+</div>
+{showHSB&&(
+<>
+{[{l:“H”,v:hsbH,s:setHsbH,min:-180,max:180,c:”#e0b0ff”},{l:“S”,v:hsbS,s:setHsbS,min:0,max:200,c:”#f5a623”},{l:“B”,v:hsbB,s:setHsbB,min:0,max:200,c:”#ffd93d”}].map(({l,v,s,min,max,c})=>(
+<div key={l} style={{display:“flex”,gap:4,alignItems:“center”,marginBottom:3}}>
+<span style={{color:”#666”,fontSize:9,width:8}}>{l}</span>
+<input type=“range” min={min} max={max} value={v} onChange={e=>s(+e.target.value)} style={{flex:1,accentColor:c}}/>
+<span style={{color:”#666”,fontSize:9,width:24,textAlign:“right”}}>{v}</span>
+</div>
+))}
+<button onClick={applyHSB} style={{padding:“3px 8px”,borderRadius:4,border:“1px solid #e0b0ff44”,background:“transparent”,color:”#e0b0ff”,cursor:“pointer”,fontSize:10,fontFamily:“inherit”,width:“100%”,marginTop:3}}>Apply HSB</button>
+</>
+)}
+</div>
+<div style={SC}>
+<span style={LB}>Reference</span>
+<label style={{display:“block”,padding:“3px 7px”,borderRadius:4,border:“1px dashed #2e2444”,color:”#666”,cursor:“pointer”,fontSize:10,textAlign:“center”,marginBottom:refImg?4:0}}>
+📎 Load<input type=“file” accept=“image/*” onChange={e=>{const r=new FileReader();r.onload=ev=>setRefImg(ev.target.result);e.target.files[0]&&r.readAsDataURL(e.target.files[0]);}} style={{display:“none”}}/>
+</label>
+{refImg&&(
+<>
+<input type=“range” min={0} max={1} step={0.05} value={refOpacity} onChange={e=>setRefOpacity(+e.target.value)} style={{width:“100%”,marginTop:3,accentColor:”#48cae4”}}/>
+<div style={{display:“flex”,justifyContent:“space-between”,fontSize:9,color:”#666”,marginTop:2}}>
+<span>{Math.round(refOpacity*100)}%</span>
+<button onClick={()=>setRefImg(null)} style={{background:“none”,border:“none”,color:”#e94560”,cursor:“pointer”,fontSize:9,padding:0}}>Remove</button>
+</div>
+</>
+)}
+</div>
+</div>
+);
+
+return (
+<div style={{display:“flex”,flexDirection:“column”,height:“100vh”,background:”#13101a”,color:”#ede0ff”,fontFamily:”‘JetBrains Mono’,‘Fira Code’,‘Courier New’,monospace”,fontSize:12,overflow:“hidden”,userSelect:“none”}}>
+
+```
+  {/* Export Modal */}
+  {showViewer&&(
+    <CharacterViewer onClose={()=>setShowViewer(false)} dataRef={dataRef} CATS={CATS} CAT_ICONS={CAT_ICONS}/>
+  )}
+
+  {exportUrl&&(
+    <div onClick={()=>setExportUrl(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",zIndex:999,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#1a1528",border:"1px solid #3a2a58",borderRadius:12,padding:20,maxWidth:500,width:"100%",display:"flex",flexDirection:"column",alignItems:"center",gap:12}}>
+        <div style={{display:"flex",justifyContent:"space-between",width:"100%"}}><span style={{color:"#7ed321",fontWeight:700}}>📤 {exportName}</span><button onClick={()=>setExportUrl(null)} style={{background:"none",border:"none",color:"#9a8ab8",cursor:"pointer",fontSize:18}}>✕</button></div>
+        <img src={exportUrl} style={{imageRendering:"pixelated",maxWidth:"100%",border:"1px solid #1a1a30",borderRadius:4,background:"#111"}}/>
+        <div style={{color:"#aa99cc",fontSize:11,textAlign:"center",lineHeight:1.6}}>Desktop: right-click → Save Image<br/>Mobile: long-press → Save to Photos</div>
+        <a href={exportUrl} download={exportName} style={{padding:"8px 20px",borderRadius:6,background:"#7ed32122",border:"1px solid #7ed321",color:"#7ed321",textDecoration:"none",fontSize:12,fontWeight:700,fontFamily:"inherit"}}>Download PNG</a>
+      </div>
+    </div>
+  )}
+
+  {/* Import Modal */}
+  {importModal&&(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",zIndex:999,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div style={{background:"#1a1528",border:"1px solid #3a2a58",borderRadius:12,padding:24,maxWidth:420,width:"100%",display:"flex",flexDirection:"column",gap:16}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span style={{color:"#e0b0ff",fontWeight:900,fontSize:15}}>📥 Import Spritesheet</span>
+          <button onClick={()=>setImportModal(null)} style={{background:"none",border:"none",color:"#7a6898",cursor:"pointer",fontSize:18}}>✕</button>
+        </div>
+        <div style={{background:"#120f1e",borderRadius:8,padding:8,textAlign:"center"}}>
+          <img src={importModal.url} style={{maxWidth:"100%",maxHeight:120,imageRendering:"pixelated",borderRadius:4}}/>
+          <div style={{color:"#7a6898",fontSize:10,marginTop:4}}>{importModal.imgW} × {importModal.imgH} px</div>
+        </div>
+        <div>
+          <div style={{color:"#9a7acc",fontSize:9,letterSpacing:2,textTransform:"uppercase",fontWeight:700,marginBottom:10}}>Frame Size</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12}}>
+            {[8,16,32,48,64,96,128].map(s=>(
+              <button key={s} onClick={()=>setImportModal(m=>({...m,frameW:s,frameH:s}))}
+                style={{padding:"5px 10px",borderRadius:6,border:`1px solid ${importModal.frameW===s&&importModal.frameH===s?"#b388ff":"#2e2444"}`,background:importModal.frameW===s&&importModal.frameH===s?"#b388ff28":"transparent",color:importModal.frameW===s&&importModal.frameH===s?"#e0b0ff":"#9a8ab8",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>
+                {s}×{s}
+              </button>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:10}}>
+            <div style={{flex:1}}>
+              <div style={{color:"#7a6898",fontSize:10,marginBottom:3}}>Custom W</div>
+              <input type="number" min={1} max={512} value={importModal.frameW} onChange={e=>setImportModal(m=>({...m,frameW:Math.max(1,+e.target.value)}))} style={{background:"#120f1e",border:"1px solid #2e2444",borderRadius:6,padding:"5px 8px",color:"#ede0ff",fontSize:12,width:"100%",boxSizing:"border-box",fontFamily:"inherit"}}/>
+            </div>
+            <div style={{flex:1}}>
+              <div style={{color:"#7a6898",fontSize:10,marginBottom:3}}>Custom H</div>
+              <input type="number" min={1} max={512} value={importModal.frameH} onChange={e=>setImportModal(m=>({...m,frameH:Math.max(1,+e.target.value)}))} style={{background:"#120f1e",border:"1px solid #2e2444",borderRadius:6,padding:"5px 8px",color:"#ede0ff",fontSize:12,width:"100%",boxSizing:"border-box",fontFamily:"inherit"}}/>
+            </div>
+          </div>
+        </div>
+        <div style={{background:"#120f1e",borderRadius:8,padding:10,display:"flex",justifyContent:"space-around",textAlign:"center"}}>
+          <div><div style={{color:"#b388ff",fontWeight:700,fontSize:18}}>{Math.max(1,Math.floor(importModal.imgW/importModal.frameW))*Math.max(1,Math.floor(importModal.imgH/importModal.frameH))}</div><div style={{color:"#7a6898",fontSize:10}}>Frames</div></div>
+          <div><div style={{color:"#b388ff",fontWeight:700,fontSize:18}}>{Math.max(1,Math.floor(importModal.imgW/importModal.frameW))}</div><div style={{color:"#7a6898",fontSize:10}}>Cols</div></div>
+          <div><div style={{color:"#b388ff",fontWeight:700,fontSize:18}}>{Math.max(1,Math.floor(importModal.imgH/importModal.frameH))}</div><div style={{color:"#7a6898",fontSize:10}}>Rows</div></div>
+        </div>
+        <button onClick={commitImport} style={{padding:"10px",borderRadius:8,border:"none",background:"linear-gradient(135deg,#b388ff,#e0b0ff)",color:"#1a1528",cursor:"pointer",fontWeight:900,fontSize:13,fontFamily:"inherit"}}>
+          ✓ Import {Math.max(1,Math.floor(importModal.imgW/importModal.frameW))*Math.max(1,Math.floor(importModal.imgH/importModal.frameH))} Frames
+        </button>
+      </div>
+    </div>
+  )}
+
+  {/* Header */}
+  <div style={{background:"#1a1528",borderBottom:"1px solid #2a2040",padding:"6px 12px",display:"flex",alignItems:"center",gap:6,flexShrink:0,flexWrap:"wrap"}}>
+    <span style={{color:"#e0b0ff",fontWeight:900,fontSize:15,letterSpacing:2,flexShrink:0,textShadow:"0 0 16px #b388ff88"}}>🌸 JojoForge</span>
+    <div style={{display:"flex",gap:3,flexWrap:"wrap",flex:1}}>
+      {CATS.map(cat=>(
+        <button key={cat} onClick={()=>setActiveCat(cat)}
+          style={{padding:"4px 8px",borderRadius:6,border:`1px solid ${activeCat===cat?"#e0b0ff":"#e0b0ff33"}`,background:activeCat===cat?"#e0b0ff28":"transparent",color:activeCat===cat?"#e0b0ff":"#e0b0ff77",cursor:"pointer",fontSize:11,fontWeight:activeCat===cat?700:400,fontFamily:"inherit"}}>
+          {CAT_ICONS[cat]}{!isMobile&&" "+cat}
+        </button>
+      ))}
+    </div>
+    <div style={{display:"flex",gap:4}}>
+      <button onClick={undo} style={{padding:"4px 8px",borderRadius:6,border:"1px solid #b388ff44",background:"transparent",color:"#b388ff99",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>↩</button>
+      <button onClick={redo} style={{padding:"4px 8px",borderRadius:6,border:"1px solid #b388ff44",background:"transparent",color:"#b388ff99",cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>↪</button>
+      <button onClick={()=>setShowViewer(true)} style={{padding:"4px 8px",borderRadius:6,border:"1px solid #e0b0ff44",background:"transparent",color:"#e0b0ff",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>👁</button>
+      <button onClick={exportPNG} style={{padding:"4px 8px",borderRadius:6,border:"1px solid #7ed32144",background:"transparent",color:"#7ed321",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>📤</button>
+      <button onClick={()=>{importFileRef.current.value="";importFileRef.current.click();}} style={{padding:"4px 8px",borderRadius:6,border:"1px solid #f5a62344",background:"transparent",color:"#f5a623",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>📥</button>
+      <input ref={importFileRef} type="file" accept="image/*" onChange={handleImport} style={{display:"none"}}/>
+    </div>
+  </div>
+
+  {/* Body */}
+  <div style={{display:"flex",flex:1,overflow:"hidden",position:"relative"}}>
+
+    {/* ── DESKTOP: Left sidebar ── */}
+    {!isMobile&&(
+      <div style={{width:sideOpen?196:40,background:"#1a1528",borderRight:"1px solid #2a2040",display:"flex",flexDirection:"column",flexShrink:0,transition:"width 0.15s",overflow:"hidden"}}>
+        <div style={{padding:"4px 4px 0",display:"flex",justifyContent:sideOpen?"flex-end":"center"}}>
+          <button onClick={()=>setSideOpen(v=>!v)} style={{background:"none",border:"none",color:"#555",cursor:"pointer",fontSize:12}}>{sideOpen?"◀":"▶"}</button>
+        </div>
+        <div style={{padding:"2px 4px",display:"flex",flexDirection:"column",gap:1}}>
+          {tools.map(t=>(
+            <button key={t.id} onClick={()=>setTool(t.id)} title={t.label}
+              style={{padding:"5px 6px",borderRadius:5,border:`1px solid ${tool===t.id?"#b388ff":"transparent"}`,background:tool===t.id?"#2a1a4e":"transparent",color:tool===t.id?"#e0b0ff":"#9a8ab8",cursor:"pointer",fontSize:13,display:"flex",alignItems:"center",gap:6,fontFamily:"inherit"}}>
+              <span style={{minWidth:16,textAlign:"center"}}>{t.icon}</span>
+              {sideOpen&&<span style={{fontSize:10,whiteSpace:"nowrap"}}>{t.label}</span>}
+            </button>
+          ))}
+        </div>
+        {sideOpen&&<DesktopSidePanelContent/>}
+      </div>
+    )}
+
+    {/* Center: Canvas */}
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
+      {/* Canvas area */}
+      <div ref={canvasWrapRef} style={{flex:1,overflow:"auto",display:"flex",alignItems:"center",justifyContent:"center",background:"#0e0b18",position:"relative",WebkitOverflowScrolling:"touch"}}>
+        <div style={{position:"relative",flexShrink:0}}>
+          <canvas ref={canvasRef}
+            style={{imageRendering:"pixelated",touchAction:"none",display:"block",boxShadow:"0 4px 32px #0008"}}
+            onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+            onTouchStart={onTouchStartCanvas} onTouchMove={onTouchMoveCanvas} onTouchEnd={onTouchEndCanvas}
+          />
+          <canvas ref={overlayRef} style={{position:"absolute",top:0,left:0,pointerEvents:"none",imageRendering:"pixelated"}}/>
+        </div>
+      </div>
+
+      {/* ── MOBILE: Quick tool bar (above frame strip) ── */}
+      {isMobile&&(
+        <div style={{background:"#120f1e",borderTop:"1px solid #2a2040",padding:"6px 8px",display:"flex",gap:4,alignItems:"center",flexShrink:0,overflowX:"auto"}}>
+          {/* Active color swatch + color picker */}
+          <input type="color" value={color} onChange={e=>setColor(e.target.value)}
+            style={{width:36,height:36,border:"2px solid #b388ff55",borderRadius:8,cursor:"pointer",background:"none",padding:0,flexShrink:0}}/>
+          <div style={{width:1,height:28,background:"#2a2040",flexShrink:0}}/>
+          {/* Tool picker button */}
+          <button onClick={()=>setShowToolPicker(!showToolPicker)}
+            style={{padding:"6px 10px",borderRadius:7,border:"1px solid #b388ff",background:"#2a1a4e",color:"#e0b0ff",cursor:"pointer",fontSize:14,fontFamily:"inherit",flexShrink:0,fontWeight:700}}>
+            {tools.find(t=>t.id===tool)?.icon||"✏️"}
+          </button>
+          <div style={{width:1,height:28,background:"#2a2040",flexShrink:0}}/>
+          {/* Brush size */}
+          <span style={{color:"#7a6898",fontSize:10,flexShrink:0}}>Sz</span>
+          <input type="range" min={1} max={8} value={brushSz} onChange={e=>setBrushSz(+e.target.value)} style={{width:60,accentColor:"#b388ff",flexShrink:0}}/>
+          <span style={{color:"#9a8ab8",fontSize:11,flexShrink:0,minWidth:16}}>{brushSz}</span>
+          <div style={{width:1,height:28,background:"#2a2040",flexShrink:0}}/>
+          {/* Zoom */}
+          <button onClick={()=>{const z=Math.max(1,zoom-1);setZoom(z);zoomRef.current=z;setTimeout(renderCanvas,0);}} style={{padding:"4px 8px",borderRadius:5,border:"1px solid #2e2444",background:"transparent",color:"#9a8ab8",cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>−</button>
+          <span style={{color:"#9a8ab8",fontSize:10,flexShrink:0,minWidth:22,textAlign:"center"}}>{zoom}x</span>
+          <button onClick={()=>{const z=Math.min(16,zoom+1);setZoom(z);zoomRef.current=z;setTimeout(renderCanvas,0);}} style={{padding:"4px 8px",borderRadius:5,border:"1px solid #2e2444",background:"transparent",color:"#9a8ab8",cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>+</button>
+          <div style={{width:1,height:28,background:"#2a2040",flexShrink:0}}/>
+          {/* Symmetry toggle */}
+          <button onClick={()=>setSymmetry(!symmetry)}
+            style={{padding:"4px 8px",borderRadius:5,border:`1px solid ${symmetry?"#b388ff":"#2e2444"}`,background:symmetry?"#b388ff22":"transparent",color:symmetry?"#b388ff":"#666",cursor:"pointer",fontSize:12,fontFamily:"inherit",flexShrink:0}}>
+            ⇔
+          </button>
+          {/* Panel toggles */}
+          {[{id:"color",icon:"🎨"},{id:"tools",icon:"🔧"},{id:"frames",icon:"🎬"}].map(p=>(
+            <button key={p.id} onClick={()=>setActivePanel(activePanel===p.id?null:p.id)}
+              style={{padding:"4px 8px",borderRadius:5,border:`1px solid ${activePanel===p.id?"#e0b0ff":"#2e2444"}`,background:activePanel===p.id?"#e0b0ff22":"transparent",color:activePanel===p.id?"#e0b0ff":"#666",cursor:"pointer",fontSize:13,fontFamily:"inherit",flexShrink:0}}>
+              {p.icon}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ── MOBILE: Tool picker popup ── */}
+      {isMobile&&showToolPicker&&(
+        <div style={{position:"absolute",bottom:isMobile?120:0,left:0,right:0,background:"#1a1528",borderTop:"1px solid #3a2a58",padding:12,zIndex:50,display:"flex",flexWrap:"wrap",gap:6}}>
+          {tools.map(t=>(
+            <button key={t.id} onClick={()=>{setTool(t.id);setShowToolPicker(false);}}
+              style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${tool===t.id?"#b388ff":"#2e2444"}`,background:tool===t.id?"#2a1a4e":"#120f1e",color:tool===t.id?"#e0b0ff":"#9a8ab8",cursor:"pointer",fontSize:13,display:"flex",alignItems:"center",gap:6,fontFamily:"inherit"}}>
+              <span>{t.icon}</span><span style={{fontSize:11}}>{t.label}</span>
+            </button>
+          ))}
+          {["rect","ellipse","triangle"].includes(tool)&&(
+            <label style={{display:"flex",alignItems:"center",gap:6,padding:"8px 12px",borderRadius:8,border:"1px solid #2e2444",background:"#120f1e",color:shapeFill?"#ede0ff":"#7a6a99",fontSize:11,cursor:"pointer",width:"100%"}}>
+              <input type="checkbox" checked={shapeFill} onChange={e=>setShapeFill(e.target.checked)} style={{accentColor:"#b388ff"}}/>Filled
+            </label>
+          )}
+        </div>
+      )}
+
+      {/* ── MOBILE: Slide-up panels ── */}
+      {isMobile&&activePanel&&(
+        <div style={{background:"#1a1528",borderTop:"1px solid #3a2a58",maxHeight:"40vh",overflow:"auto",flexShrink:0}}>
+          {activePanel==="color"&&(
+            <div style={{padding:12,display:"flex",flexDirection:"column",gap:10}}>
+              <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                <input type="color" value={color} onChange={e=>setColor(e.target.value)} style={{width:44,height:44,border:"2px solid #b388ff55",borderRadius:8,cursor:"pointer",background:"none",padding:0}}/>
+                <input type="text" value={color} onChange={e=>{if(/^#[0-9a-f]{6}$/i.test(e.target.value))setColor(e.target.value);else if(e.target.value.length<=7)setColor(e.target.value);}} style={{background:"#120f1e",border:"1px solid #2e2444",borderRadius:6,padding:"6px 10px",color:"#ede0ff",fontSize:13,fontFamily:"inherit",flex:1}}/>
+              </div>
+              {recentColors.length>0&&(
+                <div>
+                  <div style={{color:"#7a6898",fontSize:9,marginBottom:5}}>RECENT</div>
+                  <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                    {recentColors.map((c,i)=><div key={i} onClick={()=>setColor(c)} style={{width:26,height:26,background:c,borderRadius:4,cursor:"pointer",border:`2px solid ${color===c?"#fff":"transparent"}`,boxSizing:"border-box"}}/>)}
+                  </div>
+                </div>
+              )}
+              <div>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                  <span style={{color:"#9a7acc",fontSize:9,letterSpacing:2,fontWeight:700}}>PALETTE</span>
+                  <button onClick={()=>setPalette(p=>[...p,color].slice(0,32))} style={{background:"none",border:"1px solid #2e2444",borderRadius:4,color:"#b388ff",cursor:"pointer",fontSize:10,padding:"1px 6px",fontFamily:"inherit"}}>+ Add</button>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(8,1fr)",gap:4}}>
+                  {palette.map((c,i)=><div key={i} onClick={()=>setColor(c)} style={{aspectRatio:"1",background:c,borderRadius:4,cursor:"pointer",border:`2px solid ${color===c?"#fff":"transparent"}`,boxSizing:"border-box"}}/>)}
+                </div>
+              </div>
+            </div>
+          )}
+          {activePanel==="tools"&&(
+            <div style={{padding:12,display:"flex",flexDirection:"column",gap:8}}>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+                <div>
+                  <div style={{color:"#9a7acc",fontSize:9,letterSpacing:2,fontWeight:700,marginBottom:5}}>TRANSFORM</div>
+                  <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                    {[{l:"⇆H",fn:doFlipH},{l:"⇅V",fn:doFlipV},{l:"↻90°",fn:doRotate}].map(({l,fn})=>(
+                      <button key={l} onClick={fn} style={{padding:"6px 10px",borderRadius:6,border:"1px solid #48cae444",background:"transparent",color:"#48cae4",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>{l}</button>
+                    ))}
+                    <button onClick={doAutoOutline} style={{padding:"6px 10px",borderRadius:6,border:"1px solid #ffd93d44",background:"transparent",color:"#ffd93d",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>◻ Outline</button>
+                  </div>
+                </div>
+                <div>
+                  <div style={{color:"#9a7acc",fontSize:9,letterSpacing:2,fontWeight:700,marginBottom:5}}>CANVAS</div>
+                  {[{l:"Grid",v:showGrid,s:setShowGrid},{l:"Onion",v:onionSkin,s:setOnionSkin}].map(({l,v,s})=>(
+                    <label key={l} style={{display:"flex",alignItems:"center",gap:5,marginBottom:5,cursor:"pointer",color:v?"#ede0ff":"#666",fontSize:12}}>
+                      <input type="checkbox" checked={v} onChange={e=>s(e.target.checked)} style={{accentColor:"#b388ff"}}/>{l}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={{color:"#9a7acc",fontSize:9,letterSpacing:2,fontWeight:700,marginBottom:5}}>RECOLOR</div>
+                <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                  <span style={{color:"#9a8ab8",fontSize:10}}>From</span>
+                  <input type="color" value={rcFrom} onChange={e=>setRcFrom(e.target.value)} style={{width:28,height:22,border:"none",background:"none",cursor:"pointer",padding:0}}/>
+                  <span style={{color:"#9a8ab8",fontSize:10}}>→</span>
+                  <input type="color" value={rcTo} onChange={e=>setRcTo(e.target.value)} style={{width:28,height:22,border:"none",background:"none",cursor:"pointer",padding:0}}/>
+                  <span style={{color:"#9a8ab8",fontSize:9}}>Tol</span>
+                  <input type="range" min={1} max={100} value={rcTol} onChange={e=>setRcTol(+e.target.value)} style={{flex:1,minWidth:60,accentColor:"#f5a623"}}/>
+                  <label style={{display:"flex",alignItems:"center",gap:4,color:rcAllFrames?"#ede0ff":"#666",fontSize:11,cursor:"pointer"}}>
+                    <input type="checkbox" checked={rcAllFrames} onChange={e=>setRcAllFrames(e.target.checked)} style={{accentColor:"#b388ff"}}/>All
+                  </label>
+                  <button onClick={applyRecolor} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #f5a62344",background:"transparent",color:"#f5a623",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Apply</button>
+                </div>
+              </div>
+              {lassoSel&&(
+                <div style={{display:"flex",gap:4}}>
+                  <div style={{color:"#9a7acc",fontSize:9,letterSpacing:2,fontWeight:700,marginBottom:4,width:"100%"}}>SELECTION</div>
+                  <button onClick={()=>{const {minX,minY,maxX,maxY,mask}=lassoSel,px=getCurPx(),res=clonePx(px);for(let y=minY;y<=maxY;y++)for(let x=minX;x<=maxX;x++)if(mask.has(`${x},${y}`)){const i=(y*fw()+x)*4;res[i+3]=0;}pushHist(px);setCurPx(res);setLassoSel(null);renderCanvas();renderPrev();redraw();}} style={{padding:"6px 10px",borderRadius:6,border:"1px solid #e9456044",background:"transparent",color:"#e94560",cursor:"pointer",fontSize:11,fontFamily:"inherit",flex:1}}>✂ Cut</button>
+                  <button onClick={()=>setLassoSel(null)} style={{padding:"6px 10px",borderRadius:6,border:"1px solid #2e2444",background:"transparent",color:"#9a8ab8",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>✕ Clear</button>
+                </div>
+              )}
+            </div>
+          )}
+          {activePanel==="frames"&&(
+            <div style={{padding:12,display:"flex",flexDirection:"column",gap:8}}>
+              <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"}}>
+                <select value={d.activeClip} onChange={e=>setActiveClip(+e.target.value)} style={{background:"#120f1e",border:"1px solid #2e2444",borderRadius:6,padding:"5px 8px",color:"#ede0ff",fontSize:12,fontFamily:"inherit"}}>
+                  {d.clips.map((c,i)=><option key={c.id} value={i}>{c.name}</option>)}
+                </select>
+                <button onClick={addClip} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #7ed32144",background:"transparent",color:"#7ed321",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>+ Clip</button>
+                <button onClick={()=>setIsPlaying(!isPlaying)} style={{padding:"5px 10px",borderRadius:6,border:`1px solid ${isPlaying?"#e94560":"#7ed321"}44`,background:"transparent",color:isPlaying?"#e94560":"#7ed321",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>{isPlaying?"⏹":"▶"}</button>
+                <input type="number" min={1} max={60} value={fps} onChange={e=>setFps(+e.target.value)} style={{background:"#120f1e",border:"1px solid #2e2444",borderRadius:6,padding:"4px 6px",color:"#ede0ff",fontSize:11,fontFamily:"inherit",width:44}}/>
+                <span style={{color:"#666",fontSize:9}}>fps</span>
+                <button onClick={addFrame} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #b388ff44",background:"transparent",color:"#b388ff",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>+ Frame</button>
+                <button onClick={dupFrame} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #f5a62344",background:"transparent",color:"#f5a623",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>⧉ Dup</button>
+                <button onClick={delFrame} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #e9456044",background:"transparent",color:"#e94560",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>🗑</button>
+              </div>
+              <div style={{display:"flex",gap:5,overflow:"auto",paddingBottom:2}}>
+                {d.frames.map((fl,fi)=><FrameThumb key={fi} fi={fi} layers={fl} isActive={fi===d.activeFrame} onClick={()=>{setActiveFrame(fi);setActivePanel(null);}} fw={d.fw||spriteW} fh={d.fh||spriteH}/>)}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── DESKTOP: Frame strip ── */}
+      {!isMobile&&(
+        <div style={{borderTop:"1px solid #2a2040",background:"#1a1528",padding:"6px 10px",flexShrink:0}}>
+          <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:5,flexWrap:"wrap"}}>
+            <select value={d.activeClip} onChange={e=>setActiveClip(+e.target.value)} style={{background:"#120f1e",border:"1px solid #2e2444",borderRadius:5,padding:"3px 7px",color:"#ede0ff",fontSize:11,fontFamily:"inherit"}}>
+              {d.clips.map((c,i)=><option key={c.id} value={i}>{c.name}</option>)}
+            </select>
+            <button onClick={addClip} style={{padding:"3px 8px",borderRadius:5,border:"1px solid #7ed32144",background:"transparent",color:"#7ed321",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>+ Clip</button>
+            <div style={{width:1,height:12,background:"#2e2444"}}/>
+            <button onClick={()=>setIsPlaying(!isPlaying)} style={{padding:"3px 8px",borderRadius:5,border:`1px solid ${isPlaying?"#e94560":"#7ed321"}44`,background:"transparent",color:isPlaying?"#e94560":"#7ed321",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>{isPlaying?"⏹ Stop":"▶ Play"}</button>
+            <input type="number" min={1} max={60} value={fps} onChange={e=>setFps(+e.target.value)} style={{background:"#120f1e",border:"1px solid #2e2444",borderRadius:5,padding:"2px 5px",color:"#ede0ff",fontSize:10,fontFamily:"inherit",width:34}}/>
+            <span style={{color:"#666",fontSize:9}}>fps</span>
+            <div style={{marginLeft:"auto",display:"flex",gap:3}}>
+              <button onClick={addFrame} style={{padding:"3px 8px",borderRadius:5,border:"1px solid #b388ff44",background:"transparent",color:"#b388ff",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>+ Frame</button>
+              <button onClick={dupFrame} style={{padding:"3px 8px",borderRadius:5,border:"1px solid #f5a62344",background:"transparent",color:"#f5a623",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>⧉</button>
+              <button onClick={delFrame} style={{padding:"3px 8px",borderRadius:5,border:"1px solid #e9456044",background:"transparent",color:"#e94560",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>🗑</button>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:4,overflow:"auto",paddingBottom:2}}>
+            {d.frames.map((fl,fi)=><FrameThumb key={fi} fi={fi} layers={fl} isActive={fi===d.activeFrame} onClick={()=>setActiveFrame(fi)} fw={d.fw||spriteW} fh={d.fh||spriteH}/>)}
+          </div>
+        </div>
+      )}
+    </div>
+
+    {/* ── DESKTOP: Right panel ── */}
+    {!isMobile&&(
+      <div style={{width:rightOpen?210:40,background:"#1a1528",borderLeft:"1px solid #2a2040",display:"flex",flexDirection:"column",flexShrink:0,transition:"width 0.15s",overflow:"hidden"}}>
+        <div style={{padding:"4px 4px 0",display:"flex",justifyContent:rightOpen?"flex-start":"center"}}>
+          <button onClick={()=>setRightOpen(!rightOpen)} style={{background:"none",border:"none",color:"#555",cursor:"pointer",fontSize:12}}>{rightOpen?"▶":"◀"}</button>
+        </div>
+        {rightOpen&&(
+          <div style={{flex:1,overflow:"auto"}}>
+            <div style={SC}>
+              <span style={LB}>Color</span>
+              <div style={{display:"flex",gap:7,alignItems:"center"}}>
+                <input type="color" value={color} onChange={e=>setColor(e.target.value)} style={{width:32,height:32,border:"2px solid #2e2444",borderRadius:5,cursor:"pointer",background:"none",padding:0}}/>
+                <input type="text" value={color} onChange={e=>{if(/^#[0-9a-f]{6}$/i.test(e.target.value))setColor(e.target.value);else if(e.target.value.length<=7)setColor(e.target.value);}} style={{...IN,flex:1}}/>
+              </div>
+              {recentColors.length>0&&(
+                <div style={{marginTop:7}}>
+                  <div style={{color:"#7a6898",fontSize:9,marginBottom:4}}>RECENT</div>
+                  <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+                    {recentColors.map((c,i)=><div key={i} onClick={()=>setColor(c)} style={{width:18,height:18,background:c,borderRadius:3,cursor:"pointer",border:`2px solid ${color===c?"#fff":"transparent"}`,boxSizing:"border-box"}}/>)}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div style={SC}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                <span style={LB}>Palette</span>
+                <button onClick={()=>setPalette(p=>[...p,color].slice(0,32))} style={{background:"none",border:"1px solid #2e2444",borderRadius:4,color:"#b388ff",cursor:"pointer",fontSize:10,padding:"1px 5px",fontFamily:"inherit"}}>+ Add</button>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:3}}>
+                {palette.map((c,i)=><div key={i} onClick={()=>setColor(c)} style={{aspectRatio:"1",background:c,borderRadius:3,cursor:"pointer",border:`2px solid ${color===c?"#fff":"transparent"}`,boxSizing:"border-box"}}/>)}
+              </div>
+            </div>
+            <div style={SC}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                <span style={LB}>Layers</span>
+                <button onClick={addLayer} style={{background:"none",border:"1px solid #2e2444",borderRadius:4,color:"#b388ff",cursor:"pointer",fontSize:10,padding:"1px 5px",fontFamily:"inherit"}}>+ Add</button>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:2,maxHeight:110,overflow:"auto"}}>
+                {[...curFrameLayers].reverse().map((l,ri)=>{
+                  const li=curFrameLayers.length-1-ri;
+                  return (
+                    <div key={l.id} onClick={()=>setActiveLayer(li)}
+                      style={{display:"flex",alignItems:"center",gap:4,padding:"3px 5px",borderRadius:3,cursor:"pointer",background:d.activeLayer===li?"#2a1a4e":"transparent",border:`1px solid ${d.activeLayer===li?"#b388ff":"transparent"}`}}>
+                      <button onClick={e=>{e.stopPropagation();toggleLayerVis(li);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,padding:0,color:l.visible?"#ede0ff":"#333"}}>{l.visible?"👁":"🚫"}</button>
+                      <span style={{flex:1,fontSize:10,color:d.activeLayer===li?"#b388ff":"#7a6a99",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{l.name}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div style={SC}>
+              <span style={LB}>Preview 2x</span>
+              <canvas ref={prevRef} style={{width:SW*2,height:SH*2,imageRendering:"pixelated",maxWidth:"100%",display:"block",margin:"0 auto",border:"1px solid #2a2040",borderRadius:3}}/>
+            </div>
+            <div style={SC}>
+              <span style={LB}>Composite</span>
+              <div style={{display:"flex",gap:4,justifyContent:"center",marginBottom:6}}>
+                {CATS.map((cat,i)=><CatThumb key={cat} layers={compAllLayers[i]} label={cat.slice(0,3)}/>)}
+              </div>
+              <StackThumb allLayers={compAllLayers}/>
+            </div>
+          </div>
+        )}
+      </div>
+    )}
+  </div>
+</div>
+```
+
+);
+}
+
+const root = ReactDOM.createRoot(document.getElementById(‘root’));
+root.render(React.createElement(App));
+</script>
+
+</body>
+</html>
